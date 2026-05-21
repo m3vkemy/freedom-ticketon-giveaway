@@ -9,7 +9,7 @@ import os
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -28,10 +28,10 @@ ADMIN_IDS_RAW = os.environ.get("ADMIN_IDS", "ВСТАВЬТЕ_СЮДА_СВОЙ_
 
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()]
 
-# Текст рассылки победителям — поменяйте на свой
+# Текст рассылки победителям — без Markdown, чтобы избежать ошибок парсинга
 WINNER_MESSAGE = (
-    "🏆 *Поздравляем! Вы стали победителем розыгрыша* "
-    "на матче *Кайрат vs Кайсар*!\n\n"
+    "🏆 Поздравляем! Вы стали победителем розыгрыша "
+    "на матче Кайрат vs Кайсар!\n\n"
     "Скоро с вами свяжутся наши организаторы, чтобы вручить приз. "
     "Пожалуйста, оставайтесь на связи в Telegram.\n\n"
     "Спасибо за участие и до встречи! ⚽️"
@@ -66,6 +66,9 @@ def is_admin(user_id: int) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Команда /start — приветствие и запрос сектора."""
+    # Очищаем старые данные (на случай повторного запуска регистрации)
+    context.user_data.clear()
+
     # Проверяем статус регистрации
     status_result = send_to_sheets({"action": "get_status"})
     if status_result.get("current") == "closed":
@@ -191,6 +194,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def non_text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Фолбэк: пользователь прислал стикер/фото/голосовое во время регистрации."""
+    state_msg = {
+        WAITING_FOR_SECTOR: "📍 Пришлите, пожалуйста, *номер сектора* (только цифры).",
+        WAITING_FOR_SEAT: "💺 Пришлите, пожалуйста, *номер места* (только цифры).",
+    }
+    # Определяем, в каком мы шаге, по тому, что уже сохранено
+    if "sector" in context.user_data:
+        msg = state_msg[WAITING_FOR_SEAT]
+        next_state = WAITING_FOR_SEAT
+    else:
+        msg = state_msg[WAITING_FOR_SECTOR]
+        next_state = WAITING_FOR_SECTOR
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return next_state
+
+
 # ==================== АДМИН-КОМАНДЫ ====================
 
 async def open_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -222,21 +242,54 @@ async def close_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def draw_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /draw — выбрать 4 случайных победителей."""
+    """Команда /draw — выбрать 4 случайных победителей.
+    Если победители уже есть — переспрашивает у админа, что делать.
+    """
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только организаторам.")
         return
 
-    await update.message.reply_text("🎲 Выбираю победителей...")
+    # Проверяем, есть ли уже победители
+    check = send_to_sheets({"action": "get_winners"})
+    existing = check.get("winners", []) if check.get("status") == "ok" else []
+
+    if existing:
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 Переиграть (сбросить и выбрать заново)", callback_data="draw_redo"),
+            ],
+            [
+                InlineKeyboardButton("❌ Отмена", callback_data="draw_cancel"),
+            ],
+        ]
+        await update.message.reply_text(
+            f"⚠️ Победители уже выбраны ({len(existing)} человек).\n\n"
+            "Если запустите розыгрыш ещё раз, *прошлые победители будут сброшены* "
+            "и выберутся новые 4 случайных участника.\n\n"
+            "Что делать?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    await _perform_draw(update.effective_chat.id, context)
+
+
+async def _perform_draw(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Внутренняя функция: делает сам розыгрыш и шлёт результат в указанный чат."""
+    await context.bot.send_message(chat_id=chat_id, text="🎲 Выбираю победителей...")
 
     result = send_to_sheets({"action": "draw"})
 
     if result.get("status") == "empty":
-        await update.message.reply_text("В таблице пока нет участников.")
+        await context.bot.send_message(chat_id=chat_id, text="В таблице пока нет участников.")
         return
 
     if result.get("status") != "ok":
-        await update.message.reply_text(f"Ошибка: {result.get('message', 'неизвестная')}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Ошибка: {result.get('message', 'неизвестная')}",
+        )
         return
 
     winners = result.get("winners", [])
@@ -251,7 +304,29 @@ async def draw_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     text += "\nЧтобы отправить рассылку победителям, используйте /notify"
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
+
+async def draw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопок переигровки/отмены при повторном /draw."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    if query.data == "draw_cancel":
+        await query.edit_message_text("Розыгрыш отменён. Прошлые победители сохранены.")
+        return
+
+    if query.data == "draw_redo":
+        # Сбрасываем старых победителей и проводим новый розыгрыш
+        reset = send_to_sheets({"action": "reset_winners"})
+        if reset.get("status") != "ok":
+            await query.edit_message_text(f"Не удалось сбросить победителей: {reset.get('message', 'ошибка')}")
+            return
+        await query.edit_message_text("♻️ Прошлые победители сброшены. Выбираю новых...")
+        await _perform_draw(query.from_user.id, context)
 
 
 async def notify_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,13 +340,13 @@ async def notify_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Отмена", callback_data="notify_cancel"),
         ]
     ]
+    # Текст рассылки показываем БЕЗ Markdown, чтобы избежать ошибок отображения
     await update.message.reply_text(
-        "📨 *Сейчас будет отправлена такая рассылка победителям:*\n\n"
+        "📨 Сейчас будет отправлена такая рассылка победителям:\n\n"
         "————————————————————————\n"
         f"{WINNER_MESSAGE}\n"
         "————————————————————————\n\n"
         "Подтвердить отправку?",
-        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -306,29 +381,31 @@ async def notify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for w in winners:
         try:
+            # БЕЗ parse_mode — простой текст, никакие спецсимволы не сломают
             await context.bot.send_message(
                 chat_id=int(w["telegram_id"]),
                 text=WINNER_MESSAGE,
-                parse_mode="Markdown",
             )
             sent += 1
             await asyncio.sleep(0.1)
         except Forbidden:
             failed += 1
             failed_list.append(f"{w['name']} (заблокировал бота)")
+        except BadRequest as e:
+            failed += 1
+            failed_list.append(f"{w['name']} (BadRequest: {e})")
         except TelegramError as e:
             failed += 1
             failed_list.append(f"{w['name']} ({e})")
 
-    report = f"✅ Отправлено: *{sent}*\n"
+    report = f"✅ Отправлено: {sent}\n"
     if failed:
-        report += f"❌ Не доставлено: *{failed}*\n\n"
+        report += f"❌ Не доставлено: {failed}\n\n"
         report += "Не получили (свяжитесь вручную):\n" + "\n".join(f"• {x}" for x in failed_list)
 
     await context.bot.send_message(
         chat_id=query.from_user.id,
         text=report,
-        parse_mode="Markdown",
     )
 
 
@@ -374,11 +451,20 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            WAITING_FOR_SECTOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_sector)],
-            WAITING_FOR_SEAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_seat)],
+            WAITING_FOR_SECTOR: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_sector),
+                # Фолбэк на стикеры/фото/голосовые:
+                MessageHandler(~filters.TEXT & ~filters.COMMAND, non_text_fallback),
+            ],
+            WAITING_FOR_SEAT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_seat),
+                MessageHandler(~filters.TEXT & ~filters.COMMAND, non_text_fallback),
+            ],
             WAITING_FOR_CONFIRMATION: [CallbackQueryHandler(confirm, pattern="^confirm_")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        # КЛЮЧЕВОЙ ФИКС: разрешаем повторный /start в середине регистрации
+        allow_reentry=True,
     )
 
     application.add_handler(conv_handler)
@@ -389,6 +475,7 @@ def main():
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("admin", help_admin))
     application.add_handler(CallbackQueryHandler(notify_callback, pattern="^notify_"))
+    application.add_handler(CallbackQueryHandler(draw_callback, pattern="^draw_"))
 
     logger.info("Бот запущен...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
