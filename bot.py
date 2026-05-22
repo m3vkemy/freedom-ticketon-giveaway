@@ -82,7 +82,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "⚽️ *Добро пожаловать на розыгрыш!*\n\n"
         "Сегодня на матче *Кайрат vs Кайсар* мы разыгрываем призы "
-        "среди тех, кто купил билет через *Freedom SuperApp*.\n\n"
+        "среди тех, кто купил билет на матч.\n\n"
         "📍 Пожалуйста, отправьте *номер вашего сектора* (только цифры):",
         parse_mode="Markdown",
     )
